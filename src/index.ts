@@ -37,32 +37,70 @@ export function apply(ctx: Context, config: Config) {
     // 检查消息是否包含"神金" (使用去除格式后的文本)
     if (!messageForChecks.includes('神金')) return
     
-    // 检查消息是否包含6-15位数字 (使用去除格式后的文本)
+    // 检查并提取消息中的6-15位数字
     const numberRegex = /\d{6,15}/
-    if (!numberRegex.test(messageForChecks)) return
+    const match = messageForChecks.match(numberRegex)
+    if (!match) return // 如果没有匹配到数字，则直接返回
     
+    const roomId = match[0] // 提取到的数字作为直播间号
+
     // 检查消息内容是否与最近转发的历史消息中的任何一条相同
-    // 如果你希望即使 @ 不同人，但文本内容一样也算复读，就用 messageForChecks
-    // 如果你希望 @ 不同人就不是复读，用 originalMessageContent
     if (forwardedMessageHistory.includes(originalMessageContent)) { 
-      session.send('🐱 - 检测到复读机行为，停止转发')
+      session.send('看到啦看到啦，不要发那么多次嘛~')
       return
     }
     
+    let biliInfo = '' // 用于存储B站信息，默认为空
+    try {
+      // --- 获取B站投稿数 ---
+      
+      // 1. 通过直播间号获取用户信息（主要是UID）
+      const roomInfoUrl = `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${roomId}`
+      const roomInfo = await ctx.http.get(roomInfoUrl)
+      
+      if (roomInfo.code !== 0 || !roomInfo.data || !roomInfo.data.uid) {
+        throw new Error('无法通过直播间号获取UID')
+      }
+      const uid = roomInfo.data.uid
+
+      // 2. 通过UID获取用户投稿数
+      const statsUrl = `https://api.bilibili.com/x/space/navnum?mid=${uid}`
+      const statsInfo = await ctx.http.get(statsUrl)
+
+      if (statsInfo.code !== 0 || !statsInfo.data || statsInfo.data.video === undefined) {
+        throw new Error('无法获取用户投稿数')
+      }
+      const videoCount = statsInfo.data.video
+
+      // 3. 格式化B站信息 (用于转发)
+      biliInfo = `\n\n---\n用户投稿数: ${videoCount}`
+
+      // --- 【新增功能】将查询结果也发送回监听群 ---
+      try {
+        await session.send(`直播间: ${roomId}\n用户投稿数: ${videoCount}`)
+      } catch (e) {
+        ctx.logger.warn(`向监听群 ${config.monitorGroup} 发送B站信息时失败:`, e)
+      }
+      // ------------------------------------------
+
+    } catch (error) {
+      // 获取B站信息失败时，仅在控制台打印错误，不发送任何提示
+      // biliInfo将保持为空字符串，程序将继续执行，只转发原始消息
+      ctx.logger.warn(`获取直播间 ${roomId} 的B站信息失败: ${error.message}`)
+    }
+
     // 正式模式：执行实际转发
-    // 转发时，我们通常希望转发原始消息，包括 @ 提醒
-    const forwardMessage = originalMessageContent 
+    // 将B站信息（如果成功获取）附加到原始消息后进行转发
+    const forwardMessage = originalMessageContent + biliInfo
     
     try {
       let forwardedMessageId: string
       
       // 根据配置转发到QQ或QQ群
       if (config.isGroup) {
-        // 转发到QQ群
         const result = await session.bot.sendMessage(config.targetQQ, forwardMessage)
         forwardedMessageId = result[0] 
       } else {
-        // 转发到QQ
         const result = await session.bot.sendPrivateMessage(config.targetQQ, forwardMessage)
         forwardedMessageId = result[0] 
       }
@@ -70,14 +108,14 @@ export function apply(ctx: Context, config: Config) {
       // 存储消息ID映射
       messageMap.set(messageId, forwardedMessageId)
       
-      // 更新转发消息历史
+      // 更新转发消息历史 (仍然使用原始消息内容来判断复读)
       forwardedMessageHistory.push(originalMessageContent)
       if (forwardedMessageHistory.length > HISTORY_SIZE) {
         forwardedMessageHistory.shift() // 移除最旧的消息
       }
     } catch (error) {
       session.send('🐱 - 转发失败，请检查配置')
-      console.error('转发失败:', error)
+      ctx.logger.error('转发失败:', error)
     }
   })
   
@@ -85,28 +123,19 @@ export function apply(ctx: Context, config: Config) {
   ctx.on('message-deleted', async (session) => {
     const originalMessageId = session.messageId
     
-    // 检查是否是我们转发的消息
     if (messageMap.has(originalMessageId)) {
       const forwardedMessageId = messageMap.get(originalMessageId)
       
       try {
-        // 撤回转发的消息
-        // 这里的 config.targetQQ 是发送目标的 id，而不是原始消息来源的 id
-        // 注意：Koishi的deleteMessage方法通常需要 channelId 和 messageId。
-        // 对于群聊，channelId 就是 targetQQ。对于私聊，channelId 可能是 undefined 或 targetQQ。
-        // 最好是根据 isGroup 来判断
         if (config.isGroup) {
           await session.bot.deleteMessage(config.targetQQ, forwardedMessageId)
         } else {
-          // 对于私聊，Koishi的bot.deleteMessage可能需要一个明确的私聊会话ID
-          // 但通常情况下，只要知道消息ID，bot就能处理
-          await session.bot.deleteMessage(config.targetQQ, forwardedMessageId) // targetQQ 在私聊语境下实际是用户ID
+          await session.bot.deleteMessage(config.targetQQ, forwardedMessageId)
         }
         
-        // 从映射中移除
         messageMap.delete(originalMessageId)
       } catch (error) {
-        console.error('撤回转发消息失败:', error)
+        ctx.logger.error('撤回转发消息失败:', error)
       }
     }
   })
