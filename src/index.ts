@@ -15,66 +15,43 @@ export const Config: Schema<Config> = Schema.object({
   monitorGroup: Schema.string().description('监听的群号（只检测此群的消息）').required()
 })
 
-// --- 新版消息解析模块 ---
+// --- 消息解析模块 (已更新) ---
 
-/**
- * 描述一个具体的奖励项
- */
 interface Reward {
   amount: number;
-  condition: string; // e.g., "14级灯牌", "20级", "无限制"
+  condition: string;
 }
 
-/**
- * 描述一个完整的事件（时间 + 多个奖励）
- */
 interface ParsedEvent {
-  dateTime: string; // e.g., "11月28日", "12.10 生日回", "每晚 23:00"
+  dateTime: string;
   rewards: Reward[];
 }
 
-/**
- * [新] 提取消息中所有的房间号
- * @param text 消息内容
- * @returns 房间号数组
- */
 function extractAllRoomIds(text: string): string[] {
   const patterns = [
     /(?:播间号|房间号|直播间)[:：\s]*(\d{6,15})/g,
-    /\b(\d{8,15})\b/g, // 独立的8位以上数字
+    /\b(\d{8,15})\b/g,
   ];
   const foundIds = new Set<string>();
   for (const pattern of patterns) {
-    // 使用 matchAll 来获取所有匹配项
     const matches = text.matchAll(pattern);
     for (const match of matches) {
-      if (match[1]) {
-        foundIds.add(match[1]);
-      }
+      if (match[1]) foundIds.add(match[1]);
     }
   }
   return Array.from(foundIds);
 }
 
-/**
- * [升级] 提取日期和时间
- * @param line 文本行
- * @returns 格式化的日期时间字符串或 null
- */
 function extractDateTime(line: string): string | null {
-  // 匹配 MM月DD日 或 MM.DD
   let match = line.match(/(\d{1,2})\s*[月.]\s*(\d{1,2})\s*日?/);
   if (match) return `${match[1]}月${match[2]}日`;
 
-  // 匹配 "每晚11点" -> "每晚 23:00"
   match = line.match(/每晚\s*(\d{1,2})\s*点/);
   if (match) return `每晚 ${match[1].padStart(2, '0')}:00`;
   
-  // 匹配 "11月中旬"
   match = line.match(/(\d{1,2}\s*月\s*(?:上|中|下)旬)/);
   if (match) return match[1];
   
-  // 沿用旧的时间匹配逻辑作为补充
   match = line.match(/(\d{1,2})[:：.点时]\s*(\d{1,2})/);
   if (match) return `${match[1].padStart(2, '0')}:${match[2].padStart(2, '0')}`;
   
@@ -90,7 +67,6 @@ function extractDateTime(line: string): string | null {
     return `${hourVal.toString().padStart(2, '0')}:${match[1].padStart(2, '0')}`;
   }
 
-  // 匹配包含 "生日" "周年" 等关键字的行作为日期
   match = line.match(/.*?(?:生日|周年|新衣|活动).*/);
   if (match) return match[0].trim();
 
@@ -98,38 +74,34 @@ function extractDateTime(line: string): string | null {
 }
 
 /**
- * [升级] 从单行文本中提取所有奖励
+ * [已修复] 从单行文本中提取所有奖励
  * @param line 文本行
  * @returns Reward 对象数组
  */
 function extractRewards(line: string): Reward[] {
   const rewards: Reward[] = [];
-  // 正则表达式：捕获 (条件)? 和 (金额)
-  // (?:(\d{1,2})\s*级(?:灯牌)?\s*)?  -> 可选的等级条件
-  // (\d+\.?\d*w?\+?)                 -> 金额 (e.g., 2000, 1w, 10w+)
-  // (?:神金|钻石|猫猫钻)?             -> 可选的单位
-  const regex = /(?:(\d{1,2})\s*级(?:灯牌)?\s*)?(\d+\.?\d*w?\+?)(?:神金|钻石|猫猫钻)?/gi;
+  // 正则表达式修复：明确区分带'w'的金额和3-5位的普通数字金额
+  const regex = /(?:(\d{1,2})\s*级(?:灯牌)?\s*)?(?:发\s*)?(\d+\.?\d*w\+?|\b\d{3,5}\b)(?:神金|钻石|猫猫钻)?/gi;
   let match;
 
   while ((match = regex.exec(line)) !== null) {
     const condition = match[1] ? `${match[1]}级灯牌` : '无限制';
-    let amountStr = match[2].toLowerCase();
+    let amountStr = (match[2] || '').toLowerCase();
     let amount = 0;
     if (amountStr.includes('w')) {
       amount = parseFloat(amountStr.replace('w', '')) * 10000;
     } else {
-      amount = parseInt(amountStr, 10);
+      amount = parseFloat(amountStr);
     }
-    rewards.push({ amount, condition });
+    
+    // 确保金额有效
+    if (!isNaN(amount) && amount > 0) {
+      rewards.push({ amount, condition });
+    }
   }
   return rewards;
 }
 
-/**
- * [重构] 解析消息，提取所有事件
- * @param text 消息内容
- * @returns 事件数组，如果无法解析则返回 null
- */
 function parseEvents(text: string): ParsedEvent[] | null {
   const lines = text.split('\n').filter(line => line.trim() !== '');
   const events: ParsedEvent[] = [];
@@ -137,7 +109,6 @@ function parseEvents(text: string): ParsedEvent[] | null {
   
   for (const line of lines) {
     const foundDateTime = extractDateTime(line);
-    // 如果一行里同时有时间和奖励，也视为一个独立事件
     const foundRewards = extractRewards(line);
 
     if (foundDateTime) {
@@ -145,10 +116,8 @@ function parseEvents(text: string): ParsedEvent[] | null {
     }
 
     if (foundRewards.length > 0) {
-        // 如果当前行没有时间，但之前有，就用之前的时间
         const eventTime = currentDateTime || '时间未知';
         events.push({ dateTime: eventTime, rewards: foundRewards });
-        // 如果一行内同时有时间和奖励，消耗掉时间，避免影响下一行
         if(foundDateTime) currentDateTime = null;
     }
   }
@@ -161,13 +130,15 @@ function parseEvents(text: string): ParsedEvent[] | null {
 interface ForwardedEntry {
   originalMessageId: string;
   forwardedMessageId: string;
-  // 使用消息原文作为去重依据，因为解析复杂事件的签名太困难且易出错
   originalContent: string;
 }
 
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = [];
-  const HISTORY_SIZE = 30; // 增加历史记录大小
+  const HISTORY_SIZE = 30;
+
+  const REJECTION_KEYWORDS = ['签到', '打卡'];
+  const OVERRIDE_KEYWORDS = ['神金', '发', '掉落', '猫猫钻'];
 
   ctx.on('message', async (session) => {
     if (session.channelId !== config.monitorGroup) return;
@@ -176,38 +147,45 @@ export function apply(ctx: Context, config: Config) {
     const messageForChecks = session.stripped.content;
     const messageId = session.messageId;
 
-    // --- 1. [新] 唯一房间号检测 ---
-    const roomIds = extractAllRoomIds(messageForChecks);
-
-    if (roomIds.length > 1) {
-      // session.send(`检测到多个直播间号 (${roomIds.join(', ')})，为避免信息混淆，已停止处理。`);
-      return;
+    // --- 1. [新] 触发门槛检查 ---
+    // 消息必须包含明确的意图关键词或格式，否则直接忽略
+    const triggerRegex = /神金|发|掉落|猫猫钻|w|\b\d{3,5}\b/i;
+    if (!triggerRegex.test(messageForChecks)) {
+      return; // 不符合触发条件，静默忽略
     }
-    if (roomIds.length === 0) {
-        // 如果没有房间号，但包含神金等关键词，也可能是有效信息，先不退出
-        // return;
+
+    // --- 2. 智能关键词过滤 ---
+    const hasRejectionKeyword = REJECTION_KEYWORDS.some(keyword => messageForChecks.includes(keyword));
+    if (hasRejectionKeyword) {
+      const hasOverrideKeyword = OVERRIDE_KEYWORDS.some(keyword => messageForChecks.includes(keyword));
+      if (!hasOverrideKeyword) {
+        ctx.logger.info(`消息包含拒绝关键词且无覆盖词，已忽略: ${messageForChecks.substring(0, 50)}...`);
+        return;
+      }
+    }
+
+    // --- 3. 唯一房间号检测 ---
+    const roomIds = extractAllRoomIds(messageForChecks);
+    if (roomIds.length > 1) {
+      session.send(`检测到多个直播间号 (${roomIds.join(', ')})，为避免信息混淆，已停止处理。`);
+      return;
     }
     
     const roomId = roomIds.length === 1 ? roomIds[0] : null;
 
-    // --- 2. [重构] 解析事件 ---
+    // --- 4. 解析事件 ---
     const parsedEvents = parseEvents(messageForChecks);
-    // 必须解析出事件，并且有唯一的房间号，才认为是有效信息
     if (!parsedEvents || !roomId) {
-      if (messageForChecks.match(/神金|w|发|掉落|\d{3,5}/)) {
-        ctx.logger.info(`消息可能为神金信息但无法完整解析(缺少房间号或事件)，已忽略: ${messageForChecks.substring(0, 50)}...`);
-      }
-      return;
+      return; // 如果没有解析到有效事件或房间号，静默忽略
     }
 
-    // --- 3. [简化] 复读检测 ---
-    // 对于复杂消息，直接比对原文是更可靠的去重方式
+    // --- 5. 复读检测 ---
     if (forwardedHistory.some(entry => entry.originalContent === originalMessageContent)) {
-      session.send('看到啦看到啦，不要发那么多次嘛~');
+      session.send('这个消息刚刚已经发过啦~');
       return;
     }
 
-    // --- 4. 获取B站信息 (使用唯一的房间号) ---
+    // --- 6. 获取B站信息 ---
     let biliInfo = '';
     try {
       const roomInfoUrl = `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${roomId}`;
@@ -231,7 +209,7 @@ export function apply(ctx: Context, config: Config) {
       ctx.logger.warn(`获取直播间 ${roomId} 的B站信息失败: ${error.message}`);
     }
 
-    // --- 5. 执行转发 ---
+    // --- 7. 执行转发 ---
     const forwardMessage = originalMessageContent + biliInfo;
     
     try {
@@ -260,7 +238,7 @@ export function apply(ctx: Context, config: Config) {
     }
   });
   
-  // --- 撤回逻辑 (更新) ---
+  // --- 撤回逻辑 (保持不变) ---
   ctx.on('message-deleted', async (session) => {
     const originalMessageId = session.messageId;
     const entryIndex = forwardedHistory.findIndex(entry => entry.originalMessageId === originalMessageId);
