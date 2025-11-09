@@ -130,10 +130,10 @@ interface ForwardedEntry {
 
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = [];
-  const HISTORY_SIZE = 30;
+  const HISTORY_SIZE = 10;
 
   const REJECTION_KEYWORDS = ['签到', '打卡'];
-  const OVERRIDE_KEYWORDS = ['神金', '发', '掉落', '猫猫钻'];
+  const OVERRIDE_KEYWORDS = ['神金', '发'];
 
   ctx.on('message', async (session) => {
     if (session.channelId !== config.monitorGroup) return;
