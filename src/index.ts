@@ -15,7 +15,7 @@ export const Config: Schema<Config> = Schema.object({
   monitorGroup: Schema.string().description('监听的群号（只检测此群的消息）').required()
 })
 
-// --- 消息解析模块 (已更新) ---
+// --- 消息解析模块 (保持不变) ---
 
 interface Reward {
   amount: number;
@@ -73,14 +73,8 @@ function extractDateTime(line: string): string | null {
   return null;
 }
 
-/**
- * [已修复] 从单行文本中提取所有奖励
- * @param line 文本行
- * @returns Reward 对象数组
- */
 function extractRewards(line: string): Reward[] {
   const rewards: Reward[] = [];
-  // 正则表达式修复：明确区分带'w'的金额和3-5位的普通数字金额
   const regex = /(?:(\d{1,2})\s*级(?:灯牌)?\s*)?(?:发\s*)?(\d+\.?\d*w\+?|\b\d{3,5}\b)(?:神金|钻石|猫猫钻)?/gi;
   let match;
 
@@ -94,7 +88,6 @@ function extractRewards(line: string): Reward[] {
       amount = parseFloat(amountStr);
     }
     
-    // 确保金额有效
     if (!isNaN(amount) && amount > 0) {
       rewards.push({ amount, condition });
     }
@@ -147,11 +140,10 @@ export function apply(ctx: Context, config: Config) {
     const messageForChecks = session.stripped.content;
     const messageId = session.messageId;
 
-    // --- 1. [新] 触发门槛检查 ---
-    // 消息必须包含明确的意图关键词或格式，否则直接忽略
+    // --- 1. 触发门槛检查 ---
     const triggerRegex = /神金|发|掉落|猫猫钻|w|\b\d{3,5}\b/i;
     if (!triggerRegex.test(messageForChecks)) {
-      return; // 不符合触发条件，静默忽略
+      return;
     }
 
     // --- 2. 智能关键词过滤 ---
@@ -167,7 +159,7 @@ export function apply(ctx: Context, config: Config) {
     // --- 3. 唯一房间号检测 ---
     const roomIds = extractAllRoomIds(messageForChecks);
     if (roomIds.length > 1) {
-      session.send(`检测到多个直播间号 (${roomIds.join(', ')})，为避免信息混淆，已停止处理。`);
+      // session.send(`检测到多个直播间号 (${roomIds.join(', ')})，为避免信息混淆，已停止处理。`);
       return;
     }
     
@@ -176,16 +168,29 @@ export function apply(ctx: Context, config: Config) {
     // --- 4. 解析事件 ---
     const parsedEvents = parseEvents(messageForChecks);
     if (!parsedEvents || !roomId) {
-      return; // 如果没有解析到有效事件或房间号，静默忽略
-    }
-
-    // --- 5. 复读检测 ---
-    if (forwardedHistory.some(entry => entry.originalContent === originalMessageContent)) {
-      session.send('这个消息刚刚已经发过啦~');
       return;
     }
 
-    // --- 6. 获取B站信息 ---
+    // --- 5. [新] 弱上下文检查 ---
+    // 检查消息是否包含强上下文关键词
+    const strongContextRegex = /神金|发|掉落|猫猫钻|w/i;
+    const hasStrongContext = strongContextRegex.test(messageForChecks);
+    // 检查是否成功解析出时间
+    const hasTime = parsedEvents.some(event => event.dateTime !== '时间未知');
+
+    // 如果没有强上下文（纯数字），则必须有时间
+    if (!hasStrongContext && !hasTime) {
+      ctx.logger.info(`纯数字信息缺少时间，已忽略: ${messageForChecks.replace(/\s+/g, ' ').substring(0, 50)}...`);
+      return;
+    }
+
+    // --- 6. 复读检测 ---
+    if (forwardedHistory.some(entry => entry.originalContent === originalMessageContent)) {
+      session.send('看到啦看到啦，不要发那么多次嘛~');
+      return;
+    }
+
+    // --- 7. 获取B站信息 ---
     let biliInfo = '';
     try {
       const roomInfoUrl = `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${roomId}`;
@@ -207,9 +212,11 @@ export function apply(ctx: Context, config: Config) {
       }
     } catch (error) {
       ctx.logger.warn(`获取直播间 ${roomId} 的B站信息失败: ${error.message}`);
+      // session.send(`无法获取直播间 ${roomId} 的投稿数，可能是无效房间号。已停止转发。`);
+      return;
     }
 
-    // --- 7. 执行转发 ---
+    // --- 8. 执行转发 ---
     const forwardMessage = originalMessageContent + biliInfo;
     
     try {
