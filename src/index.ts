@@ -120,10 +120,12 @@ function parseEvents(text: string): ParsedEvent[] | null {
 
 // --- 插件主逻辑 (已更新) ---
 
+// [核心改动 1] 在历史记录中增加 roomId
 interface ForwardedEntry {
   originalMessageId: string;
   forwardedMessageId: string;
   originalContent: string;
+  roomId: string; // 新增字段
 }
 
 export function apply(ctx: Context, config: Config) {
@@ -171,22 +173,19 @@ export function apply(ctx: Context, config: Config) {
       return;
     }
 
-    // --- 5. [新] 弱上下文检查 ---
-    // 检查消息是否包含强上下文关键词
+    // --- 5. 弱上下文检查 ---
     const strongContextRegex = /神金|发|掉落|猫猫钻|w/i;
     const hasStrongContext = strongContextRegex.test(messageForChecks);
-    // 检查是否成功解析出时间
     const hasTime = parsedEvents.some(event => event.dateTime !== '时间未知');
-
-    // 如果没有强上下文（纯数字），则必须有时间
     if (!hasStrongContext && !hasTime) {
       ctx.logger.info(`纯数字信息缺少时间，已忽略: ${messageForChecks.replace(/\s+/g, ' ').substring(0, 50)}...`);
       return;
     }
 
-    // --- 6. 复读检测 ---
-    if (forwardedHistory.some(entry => entry.originalContent === originalMessageContent)) {
-      session.send('看到啦看到啦，不要发那么多次嘛~');
+    // --- 6. 复读检测 (已更新为基于房间号) ---
+    // [核心改动 2] 更新防复读逻辑
+    if (forwardedHistory.some(entry => entry.roomId === roomId)) {
+      session.send(`看到啦看到啦，不要发那么多次嘛~`);
       return;
     }
 
@@ -229,10 +228,12 @@ export function apply(ctx: Context, config: Config) {
         forwardedMessageId = result[0];
       }
       
+      // [核心改动 3] 存储 roomId 到历史记录
       const newEntry: ForwardedEntry = {
         originalMessageId: messageId,
         forwardedMessageId: forwardedMessageId,
         originalContent: originalMessageContent,
+        roomId: roomId, // 新增
       };
       
       forwardedHistory.push(newEntry);
