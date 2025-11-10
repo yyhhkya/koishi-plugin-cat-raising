@@ -2,17 +2,25 @@ import { Context, Schema } from 'koishi'
 
 export const name = 'cat-raising'
 
-// --- 配置 Schema (保持不变) ---
+// --- 配置 Schema (已更新) ---
 export interface Config {
   targetQQ: string
   isGroup: boolean
   monitorGroup: string
+  historySize: number // [核心改动 1] 新增配置项
 }
 
 export const Config: Schema<Config> = Schema.object({
   targetQQ: Schema.string().description('目标QQ号或QQ群号').required(),
   isGroup: Schema.boolean().description('是否为QQ群').default(false),
-  monitorGroup: Schema.string().description('监听的群号（只检测此群的消息）').required()
+  monitorGroup: Schema.string().description('监听的群号（只检测此群的消息）').required(),
+  
+  // [核心改动 2] 添加配置项的UI描述
+  historySize: Schema.number()
+    .description('防复读历史记录大小 (记录最近N条转发信息，防止短期内对同一直播间的同一活动重复转发)')
+    .default(30)
+    .min(5)
+    .max(100),
 })
 
 // --- 消息解析模块 (保持不变) ---
@@ -136,18 +144,17 @@ function parseEvents(text: string): ParsedEvent[] | null {
 
 // --- 插件主逻辑 (已更新) ---
 
-// [核心改动 1] 在历史记录中增加 dateTime
 interface ForwardedEntry {
   originalMessageId: string;
   forwardedMessageId: string;
   originalContent: string;
   roomId: string;
-  dateTime: string; // 新增字段
+  dateTime: string;
 }
 
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = [];
-  const HISTORY_SIZE = 30; // 适当增加历史记录大小以适应新规则
+  // [核心改动 3] 删除了硬编码的 const HISTORY_SIZE
 
   const REJECTION_KEYWORDS = ['签到', '打卡'];
   const OVERRIDE_KEYWORDS = ['神金', '发'];
@@ -193,16 +200,13 @@ export function apply(ctx: Context, config: Config) {
       return;
     }
 
-    // --- 6. 复读检测 (已更新为基于“房间号+时间”) ---
-    const currentDateTime = parsedEvents[0].dateTime; // 获取当前事件的时间
+    const currentDateTime = parsedEvents[0].dateTime;
 
-    // [核心改动 2] 更新防复读逻辑
     if (forwardedHistory.some(entry => entry.roomId === roomId && entry.dateTime === currentDateTime)) {
       session.send(`这个直播间在“${currentDateTime}”的活动已经转发过了哦~`);
       return;
     }
 
-    // --- 7. 获取B站信息 ---
     let biliInfo = '';
     try {
       const roomInfoUrl = `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${roomId}`;
@@ -227,7 +231,6 @@ export function apply(ctx: Context, config: Config) {
       return;
     }
 
-    // --- 8. 执行转发 ---
     const forwardMessage = originalMessageContent + biliInfo;
     
     try {
@@ -240,17 +243,17 @@ export function apply(ctx: Context, config: Config) {
         forwardedMessageId = result[0];
       }
       
-      // [核心改动 3] 存储 roomId 和 dateTime 到历史记录
       const newEntry: ForwardedEntry = {
         originalMessageId: messageId,
         forwardedMessageId: forwardedMessageId,
         originalContent: originalMessageContent,
         roomId: roomId,
-        dateTime: currentDateTime, // 新增
+        dateTime: currentDateTime,
       };
       
       forwardedHistory.push(newEntry);
-      if (forwardedHistory.length > HISTORY_SIZE) {
+      // [核心改动 4] 使用 config.historySize 替代硬编码值
+      if (forwardedHistory.length > config.historySize) {
         forwardedHistory.shift();
       }
     } catch (error) {
