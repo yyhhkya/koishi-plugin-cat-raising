@@ -45,7 +45,7 @@ function extractAllRoomIds(text: string): string[] {
 function extractDateTime(line: string): string | null {
   let match = line.match(/(\d{1,2})\s*[月.]\s*(\d{1,2})\s*日?/);
   if (match) return `${match[1]}月${match[2]}日`;
-
+  
   match = line.match(/每晚\s*(\d{1,2})\s*点/);
   if (match) return `每晚 ${match[1].padStart(2, '0')}:00`;
   
@@ -53,10 +53,20 @@ function extractDateTime(line: string): string | null {
   if (match) return match[1];
   
   match = line.match(/(\d{1,2})[:：.点时]\s*(\d{1,2})/);
-  if (match) return `${match[1].padStart(2, '0')}:${match[2].padStart(2, '0')}`;
+  if (match && match[2]) {
+    const hour = match[1].padStart(2, '0');
+    const minute = match[2].padStart(2, '0');
+    return `${hour}:${minute}`;
+  }
   
   match = line.match(/(\d{1,2})\s*点\s*半/);
   if (match) return `${match[1].padStart(2, '0')}:30`;
+
+  match = line.match(/\b(\d{1,2})\s*[.点时](?!\d)/);
+  if (match && match[1]) {
+    const hour = match[1].padStart(2, '0');
+    return `${hour}:00`;
+  }
   
   match = line.match(/(\d{1,2})\s*分/);
   if (match) {
@@ -98,21 +108,27 @@ function extractRewards(line: string): Reward[] {
 function parseEvents(text: string): ParsedEvent[] | null {
   const lines = text.split('\n').filter(line => line.trim() !== '');
   const events: ParsedEvent[] = [];
-  let currentDateTime: string | null = null;
-  
+
+  let globalDateTime: string | null = null;
   for (const line of lines) {
-    const foundDateTime = extractDateTime(line);
-    const foundRewards = extractRewards(line);
-
-    if (foundDateTime) {
-        currentDateTime = foundDateTime;
+    const timeInLine = extractDateTime(line);
+    if (timeInLine) {
+      globalDateTime = timeInLine;
+      break;
     }
+  }
 
-    if (foundRewards.length > 0) {
-        const eventTime = currentDateTime || '时间未知';
-        events.push({ dateTime: eventTime, rewards: foundRewards });
-        if(foundDateTime) currentDateTime = null;
-    }
+  const allRewards: Reward[] = [];
+  for (const line of lines) {
+    const rewardsInLine = extractRewards(line);
+    allRewards.push(...rewardsInLine);
+  }
+
+  if (allRewards.length > 0) {
+    events.push({
+      dateTime: globalDateTime || '时间未知',
+      rewards: allRewards,
+    });
   }
 
   return events.length > 0 ? events : null;
@@ -120,17 +136,18 @@ function parseEvents(text: string): ParsedEvent[] | null {
 
 // --- 插件主逻辑 (已更新) ---
 
-// [核心改动 1] 在历史记录中增加 roomId
+// [核心改动 1] 在历史记录中增加 dateTime
 interface ForwardedEntry {
   originalMessageId: string;
   forwardedMessageId: string;
   originalContent: string;
-  roomId: string; // 新增字段
+  roomId: string;
+  dateTime: string; // 新增字段
 }
 
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = [];
-  const HISTORY_SIZE = 10;
+  const HISTORY_SIZE = 30; // 适当增加历史记录大小以适应新规则
 
   const REJECTION_KEYWORDS = ['签到', '打卡'];
   const OVERRIDE_KEYWORDS = ['神金', '发'];
@@ -142,13 +159,11 @@ export function apply(ctx: Context, config: Config) {
     const messageForChecks = session.stripped.content;
     const messageId = session.messageId;
 
-    // --- 1. 触发门槛检查 ---
     const triggerRegex = /神金|发|掉落|猫猫钻|w|\b\d{3,5}\b/i;
     if (!triggerRegex.test(messageForChecks)) {
       return;
     }
 
-    // --- 2. 智能关键词过滤 ---
     const hasRejectionKeyword = REJECTION_KEYWORDS.some(keyword => messageForChecks.includes(keyword));
     if (hasRejectionKeyword) {
       const hasOverrideKeyword = OVERRIDE_KEYWORDS.some(keyword => messageForChecks.includes(keyword));
@@ -158,22 +173,18 @@ export function apply(ctx: Context, config: Config) {
       }
     }
 
-    // --- 3. 唯一房间号检测 ---
     const roomIds = extractAllRoomIds(messageForChecks);
     if (roomIds.length > 1) {
-      // session.send(`检测到多个直播间号 (${roomIds.join(', ')})，为避免信息混淆，已停止处理。`);
       return;
     }
     
     const roomId = roomIds.length === 1 ? roomIds[0] : null;
 
-    // --- 4. 解析事件 ---
     const parsedEvents = parseEvents(messageForChecks);
     if (!parsedEvents || !roomId) {
       return;
     }
 
-    // --- 5. 弱上下文检查 ---
     const strongContextRegex = /神金|发|掉落|猫猫钻|w/i;
     const hasStrongContext = strongContextRegex.test(messageForChecks);
     const hasTime = parsedEvents.some(event => event.dateTime !== '时间未知');
@@ -182,10 +193,12 @@ export function apply(ctx: Context, config: Config) {
       return;
     }
 
-    // --- 6. 复读检测 (已更新为基于房间号) ---
+    // --- 6. 复读检测 (已更新为基于“房间号+时间”) ---
+    const currentDateTime = parsedEvents[0].dateTime; // 获取当前事件的时间
+
     // [核心改动 2] 更新防复读逻辑
-    if (forwardedHistory.some(entry => entry.roomId === roomId)) {
-      session.send(`看到啦看到啦，不要发那么多次嘛~`);
+    if (forwardedHistory.some(entry => entry.roomId === roomId && entry.dateTime === currentDateTime)) {
+      session.send(`这个直播间在“${currentDateTime}”的活动已经转发过了哦~`);
       return;
     }
 
@@ -211,7 +224,6 @@ export function apply(ctx: Context, config: Config) {
       }
     } catch (error) {
       ctx.logger.warn(`获取直播间 ${roomId} 的B站信息失败: ${error.message}`);
-      // session.send(`无法获取直播间 ${roomId} 的投稿数，可能是无效房间号。已停止转发。`);
       return;
     }
 
@@ -228,12 +240,13 @@ export function apply(ctx: Context, config: Config) {
         forwardedMessageId = result[0];
       }
       
-      // [核心改动 3] 存储 roomId 到历史记录
+      // [核心改动 3] 存储 roomId 和 dateTime 到历史记录
       const newEntry: ForwardedEntry = {
         originalMessageId: messageId,
         forwardedMessageId: forwardedMessageId,
         originalContent: originalMessageContent,
-        roomId: roomId, // 新增
+        roomId: roomId,
+        dateTime: currentDateTime, // 新增
       };
       
       forwardedHistory.push(newEntry);
