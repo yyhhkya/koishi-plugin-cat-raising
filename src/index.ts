@@ -2,20 +2,18 @@ import { Context, Schema } from 'koishi'
 
 export const name = 'cat-raising'
 
-// --- 配置 Schema (已更新) ---
+// --- 配置 Schema (保持不变) ---
 export interface Config {
   targetQQ: string
   isGroup: boolean
   monitorGroup: string
-  historySize: number // [核心改动 1] 新增配置项
+  historySize: number
 }
 
 export const Config: Schema<Config> = Schema.object({
   targetQQ: Schema.string().description('目标QQ号或QQ群号').required(),
   isGroup: Schema.boolean().description('是否为QQ群').default(false),
   monitorGroup: Schema.string().description('监听的群号（只检测此群的消息）').required(),
-  
-  // [核心改动 2] 添加配置项的UI描述
   historySize: Schema.number()
     .description('防复读历史记录大小 (记录最近N条转发信息，防止短期内对同一直播间的同一活动重复转发)')
     .default(30)
@@ -144,9 +142,11 @@ function parseEvents(text: string): ParsedEvent[] | null {
 
 // --- 插件主逻辑 (已更新) ---
 
+// [核心改动 1] 在历史记录中增加 helperMessageId
 interface ForwardedEntry {
   originalMessageId: string;
   forwardedMessageId: string;
+  helperMessageId?: string; // 新增字段，用于存储发回监听群的消息ID
   originalContent: string;
   roomId: string;
   dateTime: string;
@@ -154,7 +154,6 @@ interface ForwardedEntry {
 
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = [];
-  // [核心改动 3] 删除了硬编码的 const HISTORY_SIZE
 
   const REJECTION_KEYWORDS = ['签到', '打卡'];
   const OVERRIDE_KEYWORDS = ['神金', '发'];
@@ -208,6 +207,8 @@ export function apply(ctx: Context, config: Config) {
     }
 
     let biliInfo = '';
+    let helperMessageId: string | undefined = undefined; // [核心改动 2] 准备一个变量来存储助手消息ID
+
     try {
       const roomInfoUrl = `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${roomId}`;
       const roomInfo = await ctx.http.get(roomInfoUrl);
@@ -222,7 +223,11 @@ export function apply(ctx: Context, config: Config) {
       biliInfo = `\n\n---\n用户投稿数: ${videoCount}`;
 
       try {
-        await session.send(`直播间: ${roomId}\n用户投稿数: ${videoCount}`);
+        // [核心改动 3] 捕获发回监听群消息的ID
+        const sentMessageIds = await session.send(`直播间: ${roomId}\n用户投稿数: ${videoCount}`);
+        if (sentMessageIds && sentMessageIds.length > 0) {
+          helperMessageId = sentMessageIds[0];
+        }
       } catch (e) {
         ctx.logger.warn(`向监听群 ${config.monitorGroup} 发送B站信息时失败:`, e);
       }
@@ -246,13 +251,13 @@ export function apply(ctx: Context, config: Config) {
       const newEntry: ForwardedEntry = {
         originalMessageId: messageId,
         forwardedMessageId: forwardedMessageId,
+        helperMessageId: helperMessageId, // [核心改动 4] 存入历史记录
         originalContent: originalMessageContent,
         roomId: roomId,
         dateTime: currentDateTime,
       };
       
       forwardedHistory.push(newEntry);
-      // [核心改动 4] 使用 config.historySize 替代硬编码值
       if (forwardedHistory.length > config.historySize) {
         forwardedHistory.shift();
       }
@@ -262,19 +267,34 @@ export function apply(ctx: Context, config: Config) {
     }
   });
   
-  // --- 撤回逻辑 (保持不变) ---
+  // --- 撤回逻辑 (已更新) ---
   ctx.on('message-deleted', async (session) => {
     const originalMessageId = session.messageId;
     const entryIndex = forwardedHistory.findIndex(entry => entry.originalMessageId === originalMessageId);
     
     if (entryIndex !== -1) {
       const entry = forwardedHistory[entryIndex];
+
+      // [核心改动 5] 增加撤回助手消息的逻辑
+      // 1. 撤回发回监听群的助手消息
+      if (entry.helperMessageId) {
+        try {
+          // 助手消息在监听群（即当前 session 所在的群）
+          await session.bot.deleteMessage(session.channelId, entry.helperMessageId);
+          ctx.logger.info(`成功撤回监听群内的助手消息: ${entry.helperMessageId}`);
+        } catch (error) {
+          ctx.logger.error(`撤回助手消息 (ID: ${entry.helperMessageId}) 失败:`, error);
+        }
+      }
+
+      // 2. 撤回转发到目标群的主消息
       try {
         await session.bot.deleteMessage(config.targetQQ, entry.forwardedMessageId);
         ctx.logger.info(`成功撤回转发的消息: ${entry.forwardedMessageId}`);
       } catch (error) {
         ctx.logger.error(`撤回转发消息 (ID: ${entry.forwardedMessageId}) 失败:`, error);
       } finally {
+        // 无论成功与否，都从历史记录中移除
         forwardedHistory.splice(entryIndex, 1);
       }
     }
