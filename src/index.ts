@@ -203,7 +203,7 @@ export function apply(ctx: Context, config: Config) {
     const currentDateTime = parsedEvents[0].dateTime;
 
     if (forwardedHistory.some(entry => entry.roomId === roomId && entry.dateTime === currentDateTime)) {
-      session.send(`这个直播间在“${currentDateTime}”的活动已经转发过了哦~`);
+      session.send(`看到啦看到啦，不要发那么多次嘛~`);
       return;
     }
 
