@@ -1,35 +1,36 @@
-/**
- * @name cat-raising
- * @description 一个用于监控QQ群内B站直播间奖励信息，并自动转发到指定目标的Koishi插件。
- * 它能智能解析非结构化的文本，提取关键信息（直播间号、时间、奖励），并进行去重和信息补全。
- * @version 2.1.0
- * @author YourName
- */
-
 import { Context, Schema } from 'koishi'
+import * as crypto from 'crypto'
+import { URLSearchParams } from 'url'
 
 export const name = 'cat-raising'
 
-// --- 配置 Schema ---
+// --- 配置项定义 (Schema) ---
 
-// 【改动 1】为 monitorGroups 的对象元素定义一个接口，增强类型安全和可读性
+/** 监听群组的配置 */
 export interface MonitorGroupConfig {
+  /** 要监听的 QQ 群号 */
   groupId: string
+  /** 是否在此群内发送“看到啦”之类的辅助/警告消息 */
   sendHelperMessages: boolean
 }
 
+/** 插件配置 */
 export interface Config {
+  /** 目标QQ号或QQ群号 */
   targetQQ: string
+  /** 目标是否为QQ群 */
   isGroup: boolean
-  // 【改动 2】将 monitorGroups 的类型从 string[] 改为 MonitorGroupConfig[]
+  /** 监听的群组列表及其配置 */
   monitorGroups: MonitorGroupConfig[]
+  /** 用于防复读的历史记录大小 */
   historySize: number
+  /** 用于发送B站弹幕的 access_key 列表 */
+  biliAccessKeys: string[]
 }
 
 export const Config: Schema<Config> = Schema.object({
   targetQQ: Schema.string().description('目标QQ号或QQ群号').required(),
   isGroup: Schema.boolean().description('是否为QQ群').default(false),
-  // 【改动 3】修改 Schema 定义，使其成为一个对象数组
   monitorGroups: Schema.array(Schema.object({
     groupId: Schema.string().description('要监听的 QQ 群号').required(),
     sendHelperMessages: Schema.boolean().description('是否在此群内发送“看到啦”之类的辅助/警告消息').default(true),
@@ -41,9 +42,12 @@ export const Config: Schema<Config> = Schema.object({
     .default(30)
     .min(5)
     .max(100),
+  biliAccessKeys: Schema.array(Schema.string())
+    .description('用于发送B站弹幕的 access_key 列表。插件会随机选择一个使用。如果留空，则不执行发送弹幕功能。')
+    .default([]),
 })
 
-// --- 消息解析模块 (无变动) ---
+// --- 消息解析模块 ---
 
 /**
  * 智能转换文本中的中文数字为阿拉伯数字。
@@ -87,8 +91,21 @@ function preprocessChineseNumerals(text: string): string {
   })
 }
 
-interface Reward { amount: number; condition: string }
-interface ParsedEvent { dateTime: string; rewards: Reward[] }
+/** 描述一项奖励的内容 */
+interface Reward {
+  /** 奖励数量 */
+  amount: number
+  /** 达成条件 */
+  condition: string
+}
+
+/** 解析后的事件信息结构 */
+interface ParsedEvent {
+  /** 事件的日期和时间 */
+  dateTime: string
+  /** 事件包含的奖励列表 */
+  rewards: Reward[]
+}
 
 /**
  * 从文本中提取所有可能是B站直播间的ID，并进行净化处理。
@@ -176,26 +193,116 @@ function parseEventFromText(text: string): ParsedEvent | null {
 
 // --- 插件主逻辑 ---
 
+/** 存储已转发消息的条目，用于防复读和撤回联动 */
 interface ForwardedEntry {
+  /** 源消息 ID */
   originalMessageId: string
+  /** 转发后的消息 ID */
   forwardedMessageId: string
+  /** 机器人发送的辅助消息 ID (可选) */
   helperMessageId?: string
+  /** 关联的直播间房号 */
   roomId: string
+  /** 事件时间 */
   dateTime: string
 }
 
+/** 从 Bilibili API 获取的直播间关联信息 */
 interface BiliInfo {
+  /** 主播的视频投稿总数 */
   videoCount: number
 }
 
-// 过滤关键词常量
+// --- 常量定义 ---
+
+/** 包含这些关键词的消息将被直接拒绝，不进行后续处理 */
 const HARD_REJECTION_KEYWORDS = ['发言榜单']
+/** 包含这些关键词但没有覆盖关键词的消息将被拒绝 */
 const REJECTION_KEYWORDS = ['签到', '打卡']
+/** 如果消息中包含这些关键词，可以覆盖 REJECTION_KEYWORDS 的限制 */
 const OVERRIDE_KEYWORDS = ['神金', '发']
+/** 用于初步筛选消息的触发词正则表达式 */
 const TRIGGER_REGEX = /神金|发|掉落|猫猫钻|w|\b\d{3,5}\b|一千|一百|十|九|八|七|六|五|四|三|两|二|一/i
 
+/** Bilibili 开放平台 App Key */
+const BILI_APPKEY = '4409e2ce8ffd12b8'
+/** Bilibili 开放平台 App Secret */
+const BILI_APPSECRET = '59b43e04ad6965f34319062b478f83dd'
+
+// --- Bilibili API 模块 ---
+
 /**
- * 异步获取B站直播间关联的用户信息。
+ * 为 Bilibili API 请求参数进行签名 (md5)。
+ * @param params 未签名的请求参数对象。
+ * @param appSecret App Secret.
+ * @returns 携带签名的完整请求参数。
+ */
+function signBilibiliParams(params: Record<string, any>, appSecret: string): string {
+  const sortedKeys = Object.keys(params).sort()
+  const queryString = sortedKeys.map(key => `${key}=${params[key]}`).join('&')
+  const sign = crypto.createHash('md5').update(queryString + appSecret).digest('hex')
+  return sign
+}
+
+/**
+ * 向指定的B站直播间发送弹幕。
+ * @param ctx Koishi 上下文。
+ * @param config 插件配置。
+ * @param roomId 直播间真实 ID。
+ * @param message 要发送的弹幕内容。
+ */
+async function sendBilibiliDanmaku(ctx: Context, config: Config, roomId: string, message: string): Promise<void> {
+  if (!config.biliAccessKeys || config.biliAccessKeys.length === 0) {
+    ctx.logger.info('[弹幕] 未配置 access_key，跳过发送弹幕。')
+    return
+  }
+
+  // 随机选择一个 access_key 使用
+  const accessKey = config.biliAccessKeys[Math.floor(Math.random() * config.biliAccessKeys.length)]
+
+  const url = 'https://api.live.bilibili.com/xlive/app-room/v1/dM/sendmsg'
+  const ts = Math.floor(Date.now() / 1000)
+
+  const baseParams = {
+    access_key: accessKey,
+    actionKey: 'appkey',
+    appkey: BILI_APPKEY,
+    cid: roomId,
+    msg: message,
+    rnd: ts,
+    color: '16777215', // 白色
+    fontsize: '25',
+    mode: '1', // 滚动弹幕
+    ts: ts,
+  }
+
+  const sign = signBilibiliParams(baseParams, BILI_APPSECRET)
+  const params = { ...baseParams, sign }
+  const formData = new URLSearchParams()
+  for (const key in params) {
+    formData.append(key, params[key])
+  }
+
+  try {
+    const response = await ctx.http.post(url, formData, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 BiliDroid/6.73.1 (bbcallen@gmail.com) os/android model/Mi 10 Pro mobi_app/android build/6731100 channel/xiaomi innerVer/6731110 osVer/12 network/2',
+      },
+    })
+
+    if (response.code === 0) {
+      ctx.logger.info(`[弹幕] 成功向直播间 ${roomId} 发送弹幕: "${message}"`)
+    } else {
+      ctx.logger.warn(`[弹幕] 发送失败，直播间 ${roomId}。原因: ${response.message || '未知错误'}`)
+    }
+  } catch (error) {
+    ctx.logger.error(`[弹幕] 发送请求时发生网络错误，直播间 ${roomId}:`, error)
+  }
+}
+
+/**
+ * 异步获取B站直播间关联的用户信息（如投稿数）。
  * @param ctx Koishi 上下文。
  * @param roomId 直播间ID。
  * @returns 包含用户信息的对象，失败则返回 null。
@@ -217,15 +324,20 @@ async function fetchBilibiliInfo(ctx: Context, roomId: string): Promise<BiliInfo
   }
 }
 
+/**
+ * 插件的主应用函数。
+ * @param ctx Koishi 上下文。
+ * @param config 插件配置。
+ */
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = []
   const warningMessageMap = new Map<string, string>()
 
+  // --- 消息监听与处理 ---
   ctx.on('message', async (session) => {
-    // --- 1. 初步过滤 (Guards) ---
-    // 【改动 4】修改监听群组的判断逻辑
+    // 1. 初步过滤 (Guards)
     const groupConfig = config.monitorGroups.find(g => g.groupId === session.channelId)
-    if (!groupConfig) return
+    if (!groupConfig) return // 非监听群组的消息，直接忽略
 
     const strippedContent = session.stripped.content
     if (!strippedContent.trim()) return // 忽略纯图片、表情等无文本消息
@@ -233,9 +345,9 @@ export function apply(ctx: Context, config: Config) {
     if (HARD_REJECTION_KEYWORDS.some(keyword => strippedContent.includes(keyword))) return
     if (!TRIGGER_REGEX.test(strippedContent)) return
 
-    // --- 2. 核心信息提取与验证 ---
+    // 2. 核心信息提取与验证
     const roomIds = extractAllRoomIds(session.content)
-    if (roomIds.length !== 1) {
+    if (roomIds.length !== 1) { // 只处理包含唯一房号的消息
       if (roomIds.length > 1) ctx.logger.info(`[忽略] 消息包含多个房间号: ${roomIds.join(', ')}`)
       return
     }
@@ -246,18 +358,17 @@ export function apply(ctx: Context, config: Config) {
     if (hasRejectionKeyword && !OVERRIDE_KEYWORDS.some(keyword => preprocessedMessage.includes(keyword))) return
 
     const parsedEvent = parseEventFromText(preprocessedMessage)
-    if (!parsedEvent) return
+    if (!parsedEvent) return // 未解析出任何有效奖励信息
 
     const hasStrongContext = /神金|发|w/i.test(preprocessedMessage)
     const hasTime = parsedEvent.dateTime !== '时间未知'
-    if (!hasStrongContext && !hasTime) return
+    if (!hasStrongContext && !hasTime) return // 缺乏强上下文（如“神金”）且没有时间信息，可能为误判
 
-    // --- 3. 防复读检查 ---
+    // 3. 防复读检查
     const { dateTime } = parsedEvent
     if (forwardedHistory.some(entry => entry.roomId === roomId && entry.dateTime === dateTime)) {
       ctx.logger.info(`[防复读] 检测到重复活动: 房间=${roomId}, 时间=${dateTime}`)
-      // 【改动 5】根据群组配置决定是否发送警告消息
-      if (groupConfig.sendHelperMessages) {
+      if (groupConfig.sendHelperMessages) { // 根据群组配置决定是否发送警告消息
         try {
           const [warningId] = await session.send(`看到啦看到啦，不要发那么多次嘛~`)
           if (warningId) warningMessageMap.set(session.messageId, warningId)
@@ -268,45 +379,45 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    // --- 4. 获取外部信息 ---
+    // 4. 获取外部信息
     const biliInfo = await fetchBilibiliInfo(ctx, roomId)
-    if (!biliInfo) {
-      // await session.send(`[猫猫] 获取直播间 ${roomId} 的信息失败了喵...`)
-      return
-    }
+    if (!biliInfo) return // API 获取失败则不转发
 
-    // 【改动 6】根据群组配置决定是否发送B站信息，并处理 helperMessageId 可能不存在的情况
+    // 根据群组配置决定是否发送B站信息作为辅助消息
     let helperMessageId: string | undefined
     if (groupConfig.sendHelperMessages) {
       [helperMessageId] = await session.send(`直播间: ${roomId}\n投稿数: ${biliInfo.videoCount}`)
     }
 
-    // --- 5. 转发并记录 ---
+    // 5. 转发并记录
     try {
       const forwardMessage = `${session.content}\n\n---\n投稿数: ${biliInfo.videoCount}`
       const [forwardedMessageId] = config.isGroup
         ? await session.bot.sendMessage(config.targetQQ, forwardMessage)
         : await session.bot.sendPrivateMessage(config.targetQQ, forwardMessage)
 
+      // 记录转发历史
       forwardedHistory.push({
         originalMessageId: session.messageId,
         forwardedMessageId,
-        helperMessageId, // helperMessageId 可能是 undefined，这没有问题
+        helperMessageId, // helperMessageId 可能是 undefined
         roomId,
         dateTime,
       })
       if (forwardedHistory.length > config.historySize) forwardedHistory.shift()
+
+      // 成功转发后，尝试发送弹幕
+      await sendBilibiliDanmaku(ctx, config, roomId, '喵喵喵')
+
     } catch (error) {
       session.send('🐱 - 转发失败，请检查目标QQ/群号配置是否正确')
       ctx.logger.error('[转发] 失败:', error)
     }
   })
 
-  // --- `message-deleted` 处理器 (无变动，因为已有安全检查) ---
-  // 原有的 if (entry.helperMessageId) 和 warningMessageMap.has() 检查
-  // 能完美处理 helperMessageId 和 warningMessageId 不存在的情况。
+  // --- 消息撤回处理 ---
   ctx.on('message-deleted', async (session) => {
-    // 【改动 7】同样更新这里的群组判断逻辑，确保只处理受监控群的撤回事件
+    // 确保只处理受监控群的撤回事件
     const isMonitored = config.monitorGroups.some(g => g.groupId === session.channelId)
     if (!isMonitored) return
 
@@ -316,14 +427,16 @@ export function apply(ctx: Context, config: Config) {
     const entryIndex = forwardedHistory.findIndex(entry => entry.originalMessageId === originalMessageId)
     if (entryIndex !== -1) {
       const entry = forwardedHistory[entryIndex]
+      // 联动撤回机器人发送的辅助消息
       if (entry.helperMessageId) {
         try { await session.bot.deleteMessage(session.channelId, entry.helperMessageId) }
         catch (e) { ctx.logger.warn(`[撤回] 助手消息 (ID: ${entry.helperMessageId}) 失败:`, e) }
       }
+      // 联动撤回已转发到目标的消息
       try { await session.bot.deleteMessage(config.targetQQ, entry.forwardedMessageId) }
       catch (e) { ctx.logger.warn(`[撤回] 转发消息 (ID: ${entry.forwardedMessageId}) 失败:`, e) }
       finally {
-        forwardedHistory.splice(entryIndex, 1)
+        forwardedHistory.splice(entryIndex, 1) // 从历史记录中移除
         ctx.logger.info(`[撤回] 已联动撤回与源消息 ${originalMessageId} 相关的转发。`)
       }
     }
