@@ -100,7 +100,7 @@ function extractAllRoomIds(text: string): string[] {
   const sanitizedText = text.replace(/<[^>]+>/g, '')
 
   const patterns = [
-    /(?:播间号|房间号|直播间)[:：\s]*(\d{6,15})/g,
+    /(?:播间号|房间号|直播间)[:：\s]*(\d{3,15})/g,
     /\b(\d{6,15})\b/g, // 使用单词边界确保匹配的是独立数字
   ]
   const foundIds = new Set<string>()
