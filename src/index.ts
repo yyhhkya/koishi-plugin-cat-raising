@@ -216,7 +216,7 @@ interface BiliInfo {
 // --- 常量定义 ---
 
 /** 包含这些关键词的消息将被直接拒绝，不进行后续处理 */
-const HARD_REJECTION_KEYWORDS = ['发言榜单']
+const HARD_REJECTION_KEYWORDS = ['发言榜单', '投稿数:']
 /** 包含这些关键词但没有覆盖关键词的消息将被拒绝 */
 const REJECTION_KEYWORDS = ['签到', '打卡']
 /** 如果消息中包含这些关键词，可以覆盖 REJECTION_KEYWORDS 的限制 */
