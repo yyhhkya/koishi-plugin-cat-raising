@@ -6,6 +6,14 @@ export const name = 'cat-raising'
 
 // --- 配置项定义 (Schema) ---
 
+/** B站 access_key 配置项 */
+export interface BiliAccessKeyConfig {
+  /** Bilibili access_key */
+  key: string
+  /** 对此 access_key 的备注，例如所属账号 */
+  remark?: string
+}
+
 /** 监听群组的配置 */
 export interface MonitorGroupConfig {
   /** 要监听的 QQ 群号 */
@@ -25,7 +33,7 @@ export interface Config {
   /** 用于防复读的历史记录大小 */
   historySize: number
   /** 用于发送B站弹幕的 access_key 列表 */
-  biliAccessKeys: string[]
+  biliAccessKeys: BiliAccessKeyConfig[]
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -42,8 +50,11 @@ export const Config: Schema<Config> = Schema.object({
     .default(30)
     .min(5)
     .max(100),
-  biliAccessKeys: Schema.array(Schema.string())
-    .description('用于发送B站弹幕的 access_key 列表。插件会随机选择一个使用。如果留空，则不执行发送弹幕功能。')
+  biliAccessKeys: Schema.array(Schema.object({
+    key: Schema.string().description('Bilibili access_key').required(),
+    remark: Schema.string().description('对此 access_key 的备注，例如所属账号'),
+  }))
+    .description('用于发送B站弹幕的 access_key 列表。插件会为列表中的每个 key 发送弹幕。如果留空，则不执行发送弹幕功能。')
     .default([]),
 })
 
@@ -221,6 +232,8 @@ const HARD_REJECTION_KEYWORDS = ['发言榜单', '投稿数:']
 const REJECTION_KEYWORDS = ['签到', '打卡']
 /** 如果消息中包含这些关键词，可以覆盖 REJECTION_KEYWORDS 的限制 */
 const OVERRIDE_KEYWORDS = ['神金', '发']
+/** 用于识别签到模式并拒绝的正则表达式 (例如: 110+, 99 +) */
+const CHECK_IN_REJECTION_REGEX = /\b\d{2,3}\s*\+/
 /** 用于初步筛选消息的触发词正则表达式 */
 const TRIGGER_REGEX = /神金|发|掉落|猫猫钻|w|\b\d{3,5}\b|一千|一百|十|九|八|七|六|五|四|三|两|二|一/i
 
@@ -245,59 +258,84 @@ function signBilibiliParams(params: Record<string, any>, appSecret: string): str
 }
 
 /**
- * 向指定的B站直播间发送弹幕。
+ * 使用指定的 access_key 向B站直播间发送弹幕，并内置频率限制重试逻辑。
  * @param ctx Koishi 上下文。
- * @param config 插件配置。
+ * @param keyConfig 包含 access_key 和备注的对象。
  * @param roomId 直播间真实 ID。
  * @param message 要发送的弹幕内容。
  */
-async function sendBilibiliDanmaku(ctx: Context, config: Config, roomId: string, message: string): Promise<void> {
-  if (!config.biliAccessKeys || config.biliAccessKeys.length === 0) {
-    ctx.logger.info('[弹幕] 未配置 access_key，跳过发送弹幕。')
-    return
-  }
-
-  // 随机选择一个 access_key 使用
-  const accessKey = config.biliAccessKeys[Math.floor(Math.random() * config.biliAccessKeys.length)]
+async function sendBilibiliDanmaku(ctx: Context, keyConfig: BiliAccessKeyConfig, roomId: string, message: string): Promise<void> {
+  const MAX_RETRIES = 4
+  const RETRY_DELAY_MS = 3000
+  const FREQUENCY_LIMIT_KEYWORD = '频率过快' // B站API返回的频率限制信息中的关键词
 
   const url = 'https://api.live.bilibili.com/xlive/app-room/v1/dM/sendmsg'
-  const ts = Math.floor(Date.now() / 1000)
+  const logIdentifier = keyConfig.remark || keyConfig.key.slice(0, 8)
 
-  const baseParams = {
-    access_key: accessKey,
-    actionKey: 'appkey',
-    appkey: BILI_APPKEY,
-    cid: roomId,
-    msg: message,
-    rnd: ts,
-    color: '16777215', // 白色
-    fontsize: '25',
-    mode: '1', // 滚动弹幕
-    ts: ts,
-  }
-
-  const sign = signBilibiliParams(baseParams, BILI_APPSECRET)
-  const params = { ...baseParams, sign }
-  const formData = new URLSearchParams()
-  for (const key in params) {
-    formData.append(key, params[key])
-  }
-
-  try {
-    const response = await ctx.http.post(url, formData, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 BiliDroid/6.73.1 (bbcallen@gmail.com) os/android model/Mi 10 Pro mobi_app/android build/6731100 channel/xiaomi innerVer/6731110 osVer/12 network/2',
-      },
-    })
-
-    if (response.code === 0) {
-      ctx.logger.info(`[弹幕] 成功向直播间 ${roomId} 发送弹幕: "${message}"`)
-    } else {
-      ctx.logger.warn(`[弹幕] 发送失败，直播间 ${roomId}。原因: ${response.message || '未知错误'}`)
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // 如果是重试（非首次尝试），则等待指定时间
+    if (attempt > 0) {
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
     }
-  } catch (error) {
-    ctx.logger.error(`[弹幕] 发送请求时发生网络错误，直播间 ${roomId}:`, error)
+
+    const ts = Math.floor(Date.now() / 1000)
+    const baseParams = {
+      access_key: keyConfig.key,
+      actionKey: 'appkey',
+      appkey: BILI_APPKEY,
+      cid: roomId,
+      msg: message,
+      rnd: ts,
+      color: '16777215', // 白色
+      fontsize: '25',
+      mode: '1', // 滚动弹幕
+      ts: ts,
+    }
+    const sign = signBilibiliParams(baseParams, BILI_APPSECRET)
+    const params = { ...baseParams, sign }
+    const formData = new URLSearchParams()
+    for (const key in params) {
+      formData.append(key, params[key])
+    }
+
+    try {
+      const response = await ctx.http.post(url, formData, {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0 BiliDroid/6.73.1 (bbcallen@gmail.com) os/android model/Mi 10 Pro mobi_app/android build/6731100 channel/xiaomi innerVer/6731110 osVer/12 network/2',
+        },
+      })
+
+      if (response.code === 0) {
+        const successMessage = attempt > 0
+          ? `[弹幕] [${logIdentifier}] 成功向直播间 ${roomId} 发送弹幕 (重试 ${attempt} 次后)`
+          : `[弹幕] [${logIdentifier}] 成功向直播间 ${roomId} 发送弹幕: "${message}"`
+        ctx.logger.info(successMessage)
+        return // 发送成功，立即退出函数
+      }
+
+      // 检查是否是频率限制错误
+      if (response.message?.includes(FREQUENCY_LIMIT_KEYWORD)) {
+        if (attempt < MAX_RETRIES) {
+          // 如果是频率限制且还有重试机会，记录警告并继续下一次循环
+          ctx.logger.warn(`[弹幕] [${logIdentifier}] 发送频率过快 (尝试 ${attempt + 1}/${MAX_RETRIES + 1})。准备重试...`)
+          continue
+        } else {
+          // 如果已达最大重试次数，记录最终失败信息并退出
+          ctx.logger.warn(`[弹幕] [${logIdentifier}] 发送频率过快，已达最大重试次数 (${MAX_RETRIES})，放弃发送。`)
+          return
+        }
+      }
+
+      // 如果是其他API错误，直接记录并退出，不进行重试
+      ctx.logger.warn(`[弹幕] [${logIdentifier}] 发送失败，直播间 ${roomId}。原因: ${response.message || '未知错误'}`)
+      return
+
+    } catch (error) {
+      // 如果是网络层面的错误，直接记录并退出，不进行重试
+      ctx.logger.error(`[弹幕] [${logIdentifier}] 发送请求时发生网络错误 (尝试 ${attempt + 1})，直播间 ${roomId}:`, error)
+      return
+    }
   }
 }
 
@@ -331,23 +369,29 @@ async function fetchBilibiliInfo(ctx: Context, roomId: string): Promise<BiliInfo
  */
 export function apply(ctx: Context, config: Config) {
   const forwardedHistory: ForwardedEntry[] = []
-  const warningMessageMap = new Map<string, string>()
+  const warningMessageMap = new Map<string, string>() // 注意：此Map在新逻辑下不再使用
 
   // --- 消息监听与处理 ---
   ctx.on('message', async (session) => {
     // 1. 初步过滤 (Guards)
     const groupConfig = config.monitorGroups.find(g => g.groupId === session.channelId)
-    if (!groupConfig) return // 非监听群组的消息，直接忽略
+    if (!groupConfig) return
 
     const strippedContent = session.stripped.content
-    if (!strippedContent.trim()) return // 忽略纯图片、表情等无文本消息
+    if (!strippedContent.trim()) return
 
     if (HARD_REJECTION_KEYWORDS.some(keyword => strippedContent.includes(keyword))) return
+
+    if (CHECK_IN_REJECTION_REGEX.test(strippedContent)) {
+      ctx.logger.info(`[忽略] 消息包含签到模式 (如 110+)，判定为非奖励信息。内容: "${strippedContent.replace(/\n/g, ' ')}"`)
+      return
+    }
+
     if (!TRIGGER_REGEX.test(strippedContent)) return
 
     // 2. 核心信息提取与验证
     const roomIds = extractAllRoomIds(session.content)
-    if (roomIds.length !== 1) { // 只处理包含唯一房号的消息
+    if (roomIds.length !== 1) {
       if (roomIds.length > 1) ctx.logger.info(`[忽略] 消息包含多个房间号: ${roomIds.join(', ')}`)
       return
     }
@@ -358,38 +402,33 @@ export function apply(ctx: Context, config: Config) {
     if (hasRejectionKeyword && !OVERRIDE_KEYWORDS.some(keyword => preprocessedMessage.includes(keyword))) return
 
     const parsedEvent = parseEventFromText(preprocessedMessage)
-    if (!parsedEvent) return // 未解析出任何有效奖励信息
+    if (!parsedEvent) return
 
     const hasStrongContext = /神金|发|w/i.test(preprocessedMessage)
     const hasTime = parsedEvent.dateTime !== '时间未知'
-    if (!hasStrongContext && !hasTime) return // 缺乏强上下文（如“神金”）且没有时间信息，可能为误判
+    if (!hasStrongContext && !hasTime) return
 
-    // 3. 防复读检查
-    const { dateTime } = parsedEvent
-    if (forwardedHistory.some(entry => entry.roomId === roomId && entry.dateTime === dateTime)) {
-      ctx.logger.info(`[防复读] 检测到重复活动: 房间=${roomId}, 时间=${dateTime}`)
-      if (groupConfig.sendHelperMessages) { // 根据群组配置决定是否发送警告消息
-        try {
-          const [warningId] = await session.send(`看到啦看到啦，不要发那么多次嘛~`)
-          if (warningId) warningMessageMap.set(session.messageId, warningId)
-        } catch (e) {
-          ctx.logger.warn('[消息] 发送重复警告失败:', e)
-        }
-      }
-      return
-    }
-
-    // 4. 获取外部信息
+    // 3. 核心处理流程：无论是否重复，都先获取B站信息并发送辅助消息
     const biliInfo = await fetchBilibiliInfo(ctx, roomId)
-    if (!biliInfo) return // API 获取失败则不转发
+    if (!biliInfo) return // API 获取失败则不继续处理
 
-    // 根据群组配置决定是否发送B站信息作为辅助消息
     let helperMessageId: string | undefined
     if (groupConfig.sendHelperMessages) {
-      [helperMessageId] = await session.send(`直播间: ${roomId}\n投稿数: ${biliInfo.videoCount}`)
+      try {
+        [helperMessageId] = await session.send(`直播间: ${roomId}\n投稿数: ${biliInfo.videoCount}`)
+      } catch (e) {
+        ctx.logger.warn('[消息] 发送辅助信息失败:', e)
+      }
     }
 
-    // 5. 转发并记录
+    // 4. 防复读检查：仅用于决定是否【转发】，辅助消息已发送
+    const { dateTime } = parsedEvent
+    if (forwardedHistory.some(entry => entry.roomId === roomId && entry.dateTime === dateTime)) {
+      ctx.logger.info(`[防复读] 检测到重复活动，已发送辅助信息，跳过转发: 房间=${roomId}, 时间=${dateTime}`)
+      return // 停止执行，不进行转发
+    }
+
+    // 5. 转发并记录（仅对非重复消息执行）
     try {
       const forwardMessage = `${session.content}\n\n---\n投稿数: ${biliInfo.videoCount}`
       const [forwardedMessageId] = config.isGroup
@@ -400,14 +439,20 @@ export function apply(ctx: Context, config: Config) {
       forwardedHistory.push({
         originalMessageId: session.messageId,
         forwardedMessageId,
-        helperMessageId, // helperMessageId 可能是 undefined
+        helperMessageId, // 存储辅助消息ID用于撤回联动
         roomId,
         dateTime,
       })
       if (forwardedHistory.length > config.historySize) forwardedHistory.shift()
 
-      // 成功转发后，尝试发送弹幕
-      await sendBilibiliDanmaku(ctx, config, roomId, '喵喵喵')
+      // 成功转发后，为配置中的每个 access_key 发送弹幕
+      if (config.biliAccessKeys && config.biliAccessKeys.length > 0) {
+        ctx.logger.info(`[弹幕] 准备为 ${config.biliAccessKeys.length} 个账号发送弹幕到直播间 ${roomId}...`)
+        const danmakuPromises = config.biliAccessKeys.map(keyConfig =>
+          sendBilibiliDanmaku(ctx, keyConfig, roomId, '喵喵喵')
+        )
+        Promise.allSettled(danmakuPromises)
+      }
 
     } catch (error) {
       session.send('🐱 - 转发失败，请检查目标QQ/群号配置是否正确')
@@ -417,7 +462,7 @@ export function apply(ctx: Context, config: Config) {
 
   // --- 消息撤回处理 ---
   ctx.on('message-deleted', async (session) => {
-    // 确保只处理受监控群的撤回事件
+    // 逻辑不变，依然可以正常工作
     const isMonitored = config.monitorGroups.some(g => g.groupId === session.channelId)
     if (!isMonitored) return
 
@@ -427,21 +472,22 @@ export function apply(ctx: Context, config: Config) {
     const entryIndex = forwardedHistory.findIndex(entry => entry.originalMessageId === originalMessageId)
     if (entryIndex !== -1) {
       const entry = forwardedHistory[entryIndex]
-      // 联动撤回机器人发送的辅助消息
       if (entry.helperMessageId) {
         try { await session.bot.deleteMessage(session.channelId, entry.helperMessageId) }
         catch (e) { ctx.logger.warn(`[撤回] 助手消息 (ID: ${entry.helperMessageId}) 失败:`, e) }
       }
-      // 联动撤回已转发到目标的消息
-      try { await session.bot.deleteMessage(config.targetQQ, entry.forwardedMessageId) }
+      try {
+        const targetChannel = config.isGroup ? config.targetQQ : `private:${config.targetQQ}`
+        await session.bot.deleteMessage(targetChannel, entry.forwardedMessageId)
+      }
       catch (e) { ctx.logger.warn(`[撤回] 转发消息 (ID: ${entry.forwardedMessageId}) 失败:`, e) }
       finally {
-        forwardedHistory.splice(entryIndex, 1) // 从历史记录中移除
+        forwardedHistory.splice(entryIndex, 1)
         ctx.logger.info(`[撤回] 已联动撤回与源消息 ${originalMessageId} 相关的转发。`)
       }
     }
 
-    // Case 2: 撤回的是触发了防复读警告的消息
+    // Case 2: 撤回的是触发了防复读警告的消息 (此逻辑在新规则下几乎不会被触发，但保留无害)
     if (warningMessageMap.has(originalMessageId)) {
       const warningMessageId = warningMessageMap.get(originalMessageId)
       try { await session.bot.deleteMessage(session.channelId, warningMessageId) }
